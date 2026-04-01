@@ -9,17 +9,18 @@ Uses the Arducam OV9281 (120 FPS, global shutter, monochrome) downward-
 facing camera on the Jetson Nano to detect an ArUco marker on the
 landing pad. Sends LANDING_TARGET MAVLink messages to Pixhawk PrecLand.
 
-Navigation: Intel RealSense D435i VIO (primary) + Matek MTF-01
-            PMW3901 optical flow + VL53L1X LiDAR (backup)
+Navigation: Matek MTF-01 (PMW3901 optical flow + VL53L1X LiDAR)
 Landing Camera: Arducam OV9281 (120 FPS monochrome, global shutter)
 
 Pixhawk Parameters (set beforehand):
-    PLND_ENABLED  = 1
-    PLND_TYPE     = 1  (MAVLink)
-    PLND_EST_TYPE = 0  (RawSensor)
-    EK3_SRC1_POSXY = 6 (ExternalNav)
-    EK3_SRC1_VELXY = 6 (ExternalNav)
-    GPS_TYPE       = 0 (Disabled)
+    PLND_ENABLED    = 1
+    PLND_TYPE       = 1  (MAVLink)
+    PLND_EST_TYPE   = 0  (RawSensor)
+    EK3_SRC1_VELXY  = 5  (OpticalFlow)
+    EK3_SRC1_POSZ   = 1  (Rangefinder)
+    FLOW_TYPE       = 5  (MAVLink optical flow)
+    RNGFND1_TYPE    = 2  (MAVLink / MTF-01 LiDAR)
+    GPS_TYPE        = 0  (Disabled)
 
 Usage:
     # Full sequence (takeoff + hover briefly + precision land):
@@ -38,7 +39,7 @@ import time
 import sys
 import numpy as np
 import cv2
-from dronekit import connect, VehicleMode, LocationGlobalRelative
+from dronekit import connect, VehicleMode
 from pymavlink import mavutil
 
 
@@ -53,15 +54,11 @@ TARGET_MARKER_ID = 0
 MARKER_SIZE_CM = 40.0          # physical marker size in cm
 
 # Arducam OV9281 settings
-# Monochrome, global shutter, 120 FPS capable
-# IMPORTANT: Replace with your actual calibration values!
-# Run: python3 -c "import cv2; help(cv2.calibrateCamera)" for calibration
 IMG_WIDTH = 640
 IMG_HEIGHT = 480
 CAMERA_FPS = 120
 
-# Camera intrinsics (calibrate for your specific OV9281!)
-# These are approximate — run proper checkerboard calibration
+# Camera intrinsics — REPLACE with your actual OV9281 calibration!
 CAMERA_MATRIX = np.array([
     [420.0,   0.0, 320.0],
     [  0.0, 420.0, 240.0],
@@ -74,8 +71,7 @@ DIST_COEFFS = np.array([0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
 DESCENT_SPEED = 0.3            # m/s — gentle descent rate
 LAND_ALT_THRESHOLD = 0.8      # meters — switch to LAND mode below this
 MARKER_LOST_TIMEOUT = 3.0     # seconds without marker before fallback
-SEND_RATE_HZ = 30             # landing target msg rate (match camera FPS)
-OPTICAL_FLOW_FALLBACK_ALT = 0.3  # below this, trust optical flow for final touch
+SEND_RATE_HZ = 30             # landing target msg rate
 
 
 def log(msg):
@@ -84,8 +80,8 @@ def log(msg):
     sys.stdout.flush()
 
 
-def get_rangefinder_alt(vehicle):
-    """Get altitude from rangefinder (MTF-01 VL53L1X LiDAR)."""
+def get_alt(vehicle):
+    """Get altitude from rangefinder (primary) or barometer (fallback)."""
     alt = vehicle.rangefinder.distance
     if alt is not None and alt > 0:
         return alt
@@ -97,15 +93,11 @@ def get_rangefinder_alt(vehicle):
 # ──────────────────────────────────────────────────────────
 
 def open_arducam_v4l2(device=0):
-    """
-    Open Arducam OV9281 via V4L2.
-    The OV9281 is monochrome — frames come as single-channel grayscale.
-    """
+    """Open Arducam OV9281 via V4L2 (monochrome, global shutter)."""
     cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, IMG_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, IMG_HEIGHT)
     cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-    # Use MJPG or raw format for high FPS
     cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open Arducam OV9281 (device {device})")
@@ -113,10 +105,7 @@ def open_arducam_v4l2(device=0):
 
 
 def open_arducam_gstreamer(device=0):
-    """
-    Open Arducam OV9281 via GStreamer pipeline on Jetson Nano.
-    Fallback if V4L2 doesn't work at desired FPS.
-    """
+    """Open Arducam OV9281 via GStreamer on Jetson Nano."""
     gst_pipeline = (
         f"v4l2src device=/dev/video{device} ! "
         f"video/x-raw, width={IMG_WIDTH}, height={IMG_HEIGHT}, "
@@ -139,7 +128,7 @@ class ArUcoDetector:
         self.marker_size_m = marker_size_cm / 100.0
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(ARUCO_DICT_TYPE)
         self.aruco_params = cv2.aruco.DetectorParameters()
-        # Tune for high-speed monochrome camera
+        # Tuned for high-speed monochrome camera
         self.aruco_params.adaptiveThreshConstant = 7
         self.aruco_params.adaptiveThreshWinSizeMin = 3
         self.aruco_params.adaptiveThreshWinSizeMax = 23
@@ -150,7 +139,6 @@ class ArUcoDetector:
         self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
 
-        # Object points for solvePnP
         half = self.marker_size_m / 2
         self.obj_points = np.array([
             [-half,  half, 0],
@@ -165,11 +153,7 @@ class ArUcoDetector:
 
         Returns:
             (found, angle_x, angle_y, distance_m, cx, cy)
-            - angle_x/y: angular offset from center in radians
-            - distance_m: estimated distance to marker
-            - cx, cy: marker center in pixels
         """
-        # OV9281 is mono — frame may already be grayscale
         if len(frame.shape) == 3:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         else:
@@ -186,7 +170,6 @@ class ArUcoDetector:
                 cx = np.mean(marker_corners[:, 0])
                 cy = np.mean(marker_corners[:, 1])
 
-                # Pose estimation via solvePnP
                 success, rvec, tvec = cv2.solvePnP(
                     self.obj_points, marker_corners,
                     CAMERA_MATRIX, DIST_COEFFS
@@ -245,7 +228,7 @@ def send_velocity_ned(vehicle, vn, ve, vd):
 
 
 # ──────────────────────────────────────────────────────────
-#  Takeoff (GPS-Denied)
+#  Takeoff
 # ──────────────────────────────────────────────────────────
 
 def arm_and_takeoff(vehicle, target_alt):
@@ -267,7 +250,7 @@ def arm_and_takeoff(vehicle, target_alt):
     vehicle.simple_takeoff(target_alt)
 
     while True:
-        alt = get_rangefinder_alt(vehicle)
+        alt = get_alt(vehicle)
         log(f"  Climbing: {alt:.1f}m")
         if alt >= target_alt * 0.95:
             log(f"  Reached {alt:.1f}m")
@@ -287,13 +270,15 @@ def precision_land(vehicle, cap, detector):
     1. GUIDED mode — PrecLand corrects lateral position from LANDING_TARGET
     2. Arducam OV9281 at 120 FPS detects ArUco marker
     3. Adaptive descent: slower near ground for gentle touchdown
-    4. Below 0.3m: optical flow (MTF-01) handles final touchdown
-    5. Below LAND_ALT_THRESHOLD with marker lock: switch to LAND
+    4. Below LAND_ALT_THRESHOLD with marker lock: switch to LAND
+    5. Optical flow (MTF-01) maintains position hold throughout
     """
     log(f"\n{'='*55}")
     log("  PRECISION LANDING — ArUco Guided (GPS-Denied)")
     log(f"  Camera: Arducam OV9281 @ {CAMERA_FPS} FPS")
     log(f"  Marker: 4x4_50 ID {TARGET_MARKER_ID}, {int(MARKER_SIZE_CM)}cm")
+    log(f"  Position hold: PMW3901 Optical Flow")
+    log(f"  Altitude: VL53L1X LiDAR Rangefinder")
     log(f"{'='*55}")
 
     marker_last_seen = time.time()
@@ -319,7 +304,7 @@ def precision_land(vehicle, cap, detector):
 
         found, angle_x, angle_y, distance, cx, cy = detector.detect(frame)
 
-        alt = get_rangefinder_alt(vehicle)
+        alt = get_alt(vehicle)
 
         if found:
             marker_last_seen = now
@@ -335,10 +320,9 @@ def precision_land(vehicle, cap, detector):
                 descent_rate = DESCENT_SPEED
             elif alt > 1.5:
                 descent_rate = DESCENT_SPEED * 0.6
-            elif alt > OPTICAL_FLOW_FALLBACK_ALT:
+            elif alt > 0.5:
                 descent_rate = DESCENT_SPEED * 0.3
             else:
-                # Very close to ground — minimal descent, let LAND handle it
                 descent_rate = DESCENT_SPEED * 0.15
 
             send_velocity_ned(vehicle, 0, 0, descent_rate)
@@ -347,7 +331,6 @@ def precision_land(vehicle, cap, detector):
             if frame_count % 60 == 0:
                 offset_x_deg = math.degrees(angle_x)
                 offset_y_deg = math.degrees(angle_y)
-                # Pixel offset from center
                 px_off_x = cx - IMG_WIDTH / 2
                 px_off_y = cy - IMG_HEIGHT / 2
                 log(f"  ALT={alt:.2f}m | Marker: X={offset_x_deg:+.1f}° "
@@ -358,16 +341,18 @@ def precision_land(vehicle, cap, detector):
             time_since_seen = now - marker_last_seen
 
             if frame_count % 120 == 0:
-                log(f"  ALT={alt:.2f}m | Marker: LOST ({time_since_seen:.1f}s)")
+                log(f"  ALT={alt:.2f}m | Marker: LOST ({time_since_seen:.1f}s) "
+                    f"| Optical flow holding position")
 
             if time_since_seen > MARKER_LOST_TIMEOUT:
                 if alt > 2.0:
+                    # Hold position via optical flow, stop descent
                     send_velocity_ned(vehicle, 0, 0, 0)
                     if frame_count % 120 == 0:
-                        log("  Holding position — searching for marker...")
+                        log("  Holding position (optical flow) — searching for marker...")
                 else:
-                    # Near ground without marker — optical flow handles it
-                    log("  Marker lost near ground — LAND mode (optical flow fallback)")
+                    # Near ground — optical flow will guide final landing
+                    log("  Marker lost near ground — LAND mode (optical flow guides touchdown)")
                     vehicle.mode = VehicleMode("LAND")
                     landing_complete = True
                     break
@@ -388,10 +373,10 @@ def precision_land(vehicle, cap, detector):
         time.sleep(0.005)  # ~120Hz loop to match camera
 
     # Wait for actual touchdown
-    log("\nWaiting for touchdown (optical flow + LiDAR guiding final descent)...")
+    log("\nWaiting for touchdown...")
     touchdown_timeout = time.time() + 30
     while vehicle.armed and time.time() < touchdown_timeout:
-        alt = get_rangefinder_alt(vehicle)
+        alt = get_alt(vehicle)
         log(f"  Landing... {alt:.2f}m")
         time.sleep(1)
 
@@ -402,11 +387,11 @@ def precision_land(vehicle, cap, detector):
     log("  PRECISION LANDING — RESULTS")
     log(f"{'='*55}")
     log(f"  Camera            : Arducam OV9281 @ {CAMERA_FPS} FPS (mono)")
-    log(f"  Navigation        : VIO + Optical Flow (GPS-Denied)")
-    log(f"  Altitude source   : VL53L1X LiDAR rangefinder")
+    log(f"  Navigation        : PMW3901 Optical Flow (GPS-Denied)")
+    log(f"  Altitude source   : VL53L1X LiDAR Rangefinder")
     log(f"  Frames processed  : {frame_count}")
     log(f"  Marker detections : {detect_count} ({detect_rate:.1f}%)")
-    log(f"  Final altitude    : {get_rangefinder_alt(vehicle):.2f}m")
+    log(f"  Final altitude    : {get_alt(vehicle):.2f}m")
     log(f"  Motors armed      : {vehicle.armed}")
     log(f"  Vehicle mode      : {vehicle.mode.name}")
 
@@ -441,7 +426,7 @@ def main():
 
     log("=" * 55)
     log("  IROC QUALIFICATION - TASK 3: PRECISION LANDING")
-    log("  [GPS-DENIED — ArUco + VIO + Optical Flow]")
+    log("  [GPS-DENIED — ArUco + Optical Flow + LiDAR]")
     log("=" * 55)
 
     # ── Open Arducam OV9281 ──
@@ -457,7 +442,6 @@ def main():
         log(f"ABORT: {e}")
         return
 
-    # Verify camera
     ret, test_frame = cap.read()
     if not ret:
         log("ABORT: Cannot read from Arducam")
@@ -473,7 +457,6 @@ def main():
         marker_size_cm=args.marker_size
     )
 
-    # Quick marker test
     found, ax, ay, dist, cx, cy = detector.detect(test_frame)
     if found:
         log(f"  ArUco #{args.marker_id} detected in test frame (dist={dist:.2f}m)")
@@ -494,7 +477,7 @@ def main():
             log("Stabilizing at hover altitude for 5s...")
             time.sleep(5)
         else:
-            alt = get_rangefinder_alt(vehicle)
+            alt = get_alt(vehicle)
             log(f"  Skip-takeoff mode — altitude: {alt:.1f}m")
             if vehicle.mode.name != "GUIDED":
                 vehicle.mode = VehicleMode("GUIDED")

@@ -5,9 +5,15 @@ ISRO IROC Qualification - Task 2: Hover Stability (GPS-Denied)
 After take-off, the ASCEND shall hover at a fixed height (3-6m) for a
 minimum of 5 minutes maintaining stable attitude and altitude.
 
-Navigation: Intel RealSense D435i VIO (primary) + Matek MTF-01
-            PMW3901 optical flow + VL53L1X LiDAR (backup)
-Altitude: VL53L1X LiDAR rangefinder (primary) + VIO Z-axis (backup)
+Navigation: Matek MTF-01 (PMW3901 optical flow + VL53L1X LiDAR)
+Altitude: VL53L1X LiDAR rangefinder (primary) + barometer (fallback)
+
+Pixhawk Parameters (set beforehand):
+    EK3_SRC1_VELXY  = 5  (OpticalFlow)
+    EK3_SRC1_POSZ   = 1  (Rangefinder)
+    FLOW_TYPE       = 5  (MAVLink optical flow)
+    RNGFND1_TYPE    = 2  (MAVLink / MTF-01 LiDAR)
+    GPS_TYPE        = 0  (Disabled)
 
 Usage:
     # Standalone (full sequence):
@@ -37,7 +43,6 @@ LOG_INTERVAL = 1.0                   # seconds between telemetry logs
 ALTITUDE_TOLERANCE = 0.5             # meters drift allowed
 MAX_TILT_ANGLE = 10.0                # degrees — flag if exceeded
 VIBRATION_THRESHOLD = 30.0           # m/s²
-POSITION_DRIFT_WARN = 1.5            # meters horizontal drift warning
 
 
 def log(msg):
@@ -46,14 +51,14 @@ def log(msg):
     sys.stdout.flush()
 
 
-def get_rangefinder_alt(vehicle):
-    """Get altitude from rangefinder (MTF-01 VL53L1X). Falls back to VIO."""
+def get_alt(vehicle):
+    """Get altitude from rangefinder (primary) or barometer (fallback)."""
     alt = vehicle.rangefinder.distance
     if alt is not None and alt > 0:
         return alt, "RNGFND"
     alt = vehicle.location.global_relative_frame.alt
     if alt is not None and alt > 0:
-        return alt, "VIO"
+        return alt, "BARO"
     return 0, "NONE"
 
 
@@ -65,21 +70,12 @@ def get_vibration(vehicle):
     return None, None, None
 
 
-def get_vio_position(vehicle):
-    """Get local position from VIO (VISION_POSITION_ESTIMATE or LOCAL_POSITION_NED)."""
-    lpos = vehicle._master.recv_match(
-        type='LOCAL_POSITION_NED', blocking=True, timeout=2)
-    if lpos:
-        return lpos.x, lpos.y, lpos.z
-    return None, None, None
-
-
-def get_optical_flow_quality(vehicle):
-    """Get optical flow quality from MTF-01."""
+def get_optical_flow(vehicle):
+    """Get optical flow quality and data from MTF-01."""
     of = vehicle._master.recv_match(type='OPTICAL_FLOW', blocking=True, timeout=2)
     if of:
-        return of.quality
-    return None
+        return of.quality, of.flow_x, of.flow_y
+    return None, None, None
 
 
 def wait_for_armable(vehicle, timeout=30):
@@ -94,7 +90,7 @@ def wait_for_armable(vehicle, timeout=30):
 
 
 def arm_and_takeoff(vehicle, target_alt):
-    """Full arm + takeoff sequence for GPS-denied flight."""
+    """Full arm + takeoff sequence."""
     if not wait_for_armable(vehicle):
         log("ABORT: Vehicle not armable")
         return False
@@ -118,7 +114,7 @@ def arm_and_takeoff(vehicle, target_alt):
     vehicle.simple_takeoff(target_alt)
 
     while True:
-        alt, src = get_rangefinder_alt(vehicle)
+        alt, src = get_alt(vehicle)
         log(f"  Climbing... {alt:.1f}m ({src})")
         if alt >= target_alt * 0.95:
             log(f"  Reached target altitude: {alt:.1f}m")
@@ -128,20 +124,13 @@ def arm_and_takeoff(vehicle, target_alt):
 
 def run_hover_test(vehicle, target_alt, duration, log_file):
     """
-    Main hover stability test. Monitors altitude (rangefinder/VIO),
-    attitude, position drift (VIO local frame), vibration, optical flow
-    quality, and battery for the specified duration.
+    Main hover stability test. Monitors altitude (rangefinder),
+    attitude, optical flow quality, vibration, and battery.
     """
     log(f"\n{'='*55}")
     log(f"  HOVER STABILITY TEST — {duration}s at {target_alt:.1f}m")
-    log(f"  [GPS-DENIED — VIO + Optical Flow + LiDAR]")
+    log(f"  [Optical Flow + LiDAR Rangefinder]")
     log(f"{'='*55}")
-
-    # Record starting VIO position for drift calculation
-    start_x, start_y, start_z = get_vio_position(vehicle)
-    if start_x is None:
-        start_x, start_y, start_z = 0, 0, 0
-        log("  WARNING: No VIO local position — drift tracking unavailable")
 
     # CSV telemetry log
     csv_writer = None
@@ -153,8 +142,7 @@ def run_hover_test(vehicle, target_alt, duration, log_file):
             'elapsed_s', 'altitude_m', 'alt_source', 'alt_error_m',
             'roll_deg', 'pitch_deg', 'yaw_deg',
             'vibe_x', 'vibe_y', 'vibe_z',
-            'vio_x', 'vio_y', 'vio_z', 'hdrift_m',
-            'optflow_quality',
+            'optflow_quality', 'flow_x', 'flow_y',
             'batt_v', 'batt_pct', 'mode'
         ])
 
@@ -163,14 +151,14 @@ def run_hover_test(vehicle, target_alt, duration, log_file):
     max_roll = 0
     max_pitch = 0
     max_vibe = 0
-    max_hdrift = 0
+    min_of_quality = 255
     anomalies = 0
 
     start_time = time.time()
     last_log_time = 0
 
-    log("\nTime   | Alt(m) | Src  | AltErr | Roll°  | Pitch° | Vibe   | Drift(m) | OF  | Batt")
-    log("-" * 95)
+    log("\nTime   | Alt(m) | Src  | AltErr | Roll°  | Pitch° | Vibe   | OF Qual | Batt")
+    log("-" * 85)
 
     try:
         while True:
@@ -185,7 +173,7 @@ def run_hover_test(vehicle, target_alt, duration, log_file):
             last_log_time = now
 
             # ── Gather telemetry ──
-            alt, alt_src = get_rangefinder_alt(vehicle)
+            alt, alt_src = get_alt(vehicle)
             alt_error = alt - target_alt
 
             att = vehicle.attitude
@@ -196,17 +184,7 @@ def run_hover_test(vehicle, target_alt, duration, log_file):
             vx, vy, vz = get_vibration(vehicle)
             vibe_max = max(vx or 0, vy or 0, vz or 0)
 
-            # Horizontal drift from VIO local position
-            lx, ly, lz = get_vio_position(vehicle)
-            if lx is not None:
-                dx = lx - start_x
-                dy = ly - start_y
-                hdrift = math.sqrt(dx**2 + dy**2)
-            else:
-                lx, ly, lz = 0, 0, 0
-                hdrift = 0
-
-            of_quality = get_optical_flow_quality(vehicle)
+            of_quality, flow_x, flow_y = get_optical_flow(vehicle)
 
             batt = vehicle.battery
             batt_v = batt.voltage or 0
@@ -217,7 +195,8 @@ def run_hover_test(vehicle, target_alt, duration, log_file):
             max_roll = max(max_roll, abs(roll_deg))
             max_pitch = max(max_pitch, abs(pitch_deg))
             max_vibe = max(max_vibe, vibe_max)
-            max_hdrift = max(max_hdrift, hdrift)
+            if of_quality is not None:
+                min_of_quality = min(min_of_quality, of_quality)
 
             # ── Anomaly detection ──
             flags = []
@@ -227,8 +206,8 @@ def run_hover_test(vehicle, target_alt, duration, log_file):
                 flags.append("TILT")
             if vibe_max > VIBRATION_THRESHOLD:
                 flags.append("VIBRATION")
-            if hdrift > POSITION_DRIFT_WARN:
-                flags.append("POS_DRIFT")
+            if of_quality is not None and of_quality < 50:
+                flags.append("LOW_FLOW")
             if vehicle.mode.name != "GUIDED":
                 flags.append("MODE_CHANGE")
 
@@ -242,7 +221,7 @@ def run_hover_test(vehicle, target_alt, duration, log_file):
             flag_str = f" !! {','.join(flags)}" if flags else ""
             log(f"{mins:02d}:{secs:02d} | {alt:5.2f}  | {alt_src:4s} | {alt_error:+.2f}  | "
                 f"{roll_deg:+5.1f}  | {pitch_deg:+5.1f}  | {vibe_max:5.1f}  | "
-                f"{hdrift:5.2f}    | {of_str} | {batt_v:.1f}V{flag_str}")
+                f"{of_str}     | {batt_v:.1f}V{flag_str}")
 
             # ── CSV log ──
             if csv_writer:
@@ -251,8 +230,9 @@ def run_hover_test(vehicle, target_alt, duration, log_file):
                     f"{roll_deg:.2f}", f"{pitch_deg:.2f}", f"{yaw_deg:.2f}",
                     f"{vx:.1f}" if vx else "", f"{vy:.1f}" if vy else "",
                     f"{vz:.1f}" if vz else "",
-                    f"{lx:.3f}", f"{ly:.3f}", f"{lz:.3f}", f"{hdrift:.2f}",
                     str(of_quality) if of_quality is not None else "",
+                    f"{flow_x:.2f}" if flow_x is not None else "",
+                    f"{flow_y:.2f}" if flow_y is not None else "",
                     f"{batt_v:.2f}", str(batt_pct), vehicle.mode.name
                 ])
 
@@ -272,8 +252,8 @@ def run_hover_test(vehicle, target_alt, duration, log_file):
     log(f"\n{'='*55}")
     log("  HOVER STABILITY TEST — RESULTS")
     log(f"{'='*55}")
-    log(f"  Navigation        : VIO + Optical Flow (GPS-Denied)")
-    log(f"  Altitude source   : LiDAR rangefinder + VIO")
+    log(f"  Navigation        : PMW3901 Optical Flow (GPS-Denied)")
+    log(f"  Altitude source   : VL53L1X LiDAR Rangefinder")
     log(f"  Duration          : {int(elapsed)}s / {duration}s")
     log(f"  Target altitude   : {target_alt:.1f}m")
     log(f"  Avg altitude error: {avg_alt_error:.3f}m")
@@ -281,7 +261,7 @@ def run_hover_test(vehicle, target_alt, duration, log_file):
     log(f"  Max roll          : {max_roll:.2f}°")
     log(f"  Max pitch         : {max_pitch:.2f}°")
     log(f"  Max vibration     : {max_vibe:.1f} m/s²")
-    log(f"  Max horiz drift   : {max_hdrift:.2f}m (VIO local frame)")
+    log(f"  Min OF quality    : {min_of_quality if min_of_quality < 255 else 'N/A'}")
     log(f"  Anomaly events    : {anomalies}")
     log(f"  Battery           : {batt_v:.1f}V")
 
@@ -325,7 +305,7 @@ def main():
 
     log("=" * 55)
     log("  IROC QUALIFICATION - TASK 2: HOVER STABILITY")
-    log("  [GPS-DENIED — VIO + Optical Flow + LiDAR]")
+    log("  [GPS-DENIED — Optical Flow + LiDAR Rangefinder]")
     log("=" * 55)
     log(f"Connecting to vehicle on {args.connect}...")
 
@@ -343,7 +323,7 @@ def main():
                 log("ABORT: Takeoff failed")
                 return
         else:
-            alt, src = get_rangefinder_alt(vehicle)
+            alt, src = get_alt(vehicle)
             log(f"  Skip-takeoff mode — altitude: {alt:.1f}m ({src})")
             if alt < 2.0:
                 log("WARNING: Altitude below 2m — drone may not be airborne!")
